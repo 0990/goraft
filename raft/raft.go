@@ -14,12 +14,12 @@ import (
 
 type ApplyMsg struct {
 	CommandValid bool
-	Command      interface{}
+	Command      any
 	CommandIndex int
 }
 
 type LogEntry struct {
-	Command interface{}
+	Command any
 	Term    int
 	Index   int
 }
@@ -336,7 +336,7 @@ func (rf *Raft) Start(command any) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	isLeader = !rf.killed() && rf.identify == LEADER
-	term := rf.currentTerm
+	term = rf.currentTerm
 
 	// Raft中所有的操作都是需要进过leader进行操作的
 	// 如果是leader, 就进行相应的操作
@@ -345,7 +345,7 @@ func (rf *Raft) Start(command any) (int, int, bool) {
 			return commandState.Index, commandState.Term, isLeader
 		}
 
-		index := len(rf.logs)
+		index = len(rf.logs)
 		logEntry := LogEntry{
 			Command: command,
 			Term:    term,
@@ -610,7 +610,11 @@ func MakeRaft(peers []*rpcutil.ClientEnd, me int, persister *Persister, applyCh 
 			case FOLLOWER:
 				oldCnt := rf.hbCnt
 				rf.mu.Unlock()
-				timeout := time.Duration(randomTimeout(700, 1000)) * time.Millisecond
+
+				timeout := time.Duration(randomTimeout(7000000, 10000000)) * time.Millisecond
+				if oldCnt < 10 {
+					timeout = time.Duration(randomTimeout(700, 1000)) * time.Millisecond
+				}
 				time.Sleep(timeout)
 				func() {
 					rf.mu.Lock()
@@ -664,7 +668,7 @@ func MakeRaft(peers []*rpcutil.ClientEnd, me int, persister *Persister, applyCh 
 				DPrintf("当前Leader是: %d\n", rf.me)
 				rf.mu.Unlock()
 				rf.doAppendCh <- HeartBeat
-				time.Sleep(time.Millisecond * 100)
+				time.Sleep(time.Second * 5000)
 			}
 		}
 	}()
@@ -688,4 +692,108 @@ func (rf *Raft) leaderElection(wonCh chan int, wgp *sync.WaitGroup) {
 	defer wgp.Done()
 
 	args := &RequestVoteArgs{}
+	args.CandidateId = rf.me
+	rf.mu.Lock()
+
+	lcTerm := rf.currentTerm
+	args.Term = rf.currentTerm
+	args.LastLogIndex = len(rf.logs) - 1
+	args.LastLogTerm = rf.logs[args.LastLogIndex].Term
+	rf.mu.Unlock()
+	c := make(chan *RequestVoteReply, rf.peersLen)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	defer wg.Done()
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			reply := RequestVoteReply{}
+			ok := rf.sendRequestVote(i, args, &reply)
+			if !ok {
+				c <- nil
+				return
+			}
+			c <- &reply
+		}(i)
+	}
+	grantedCount := 1
+	notGrantedCount := 0
+	tgt := rf.peersLen / 2
+	for finish := 1; finish < rf.peersLen; finish++ {
+		reply := <-c
+		rf.mu.Lock()
+		// 如果当前自己的任期号改变了, 说明进入了新的任期, 直接返回
+		if rf.currentTerm != lcTerm {
+			rf.mu.Unlock()
+			break
+		}
+
+		// 如果状态不是CANDIDATE状态, 说明退化为FOLLOWER了, 直接返回
+		if rf.identify != CANDIDATE {
+			rf.mu.Unlock()
+			break
+		}
+
+		rf.mu.Unlock()
+		if reply == nil {
+			notGrantedCount++
+			continue
+		}
+
+		if reply.VoteGranted {
+			grantedCount++
+			if grantedCount > tgt {
+				func() {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.identify != LEADER {
+						rf.identify = LEADER
+						nextIndex := len(rf.logs)
+						for i := range rf.nextIndex {
+							rf.nextIndex[i] = nextIndex
+						}
+						// 同时发送HeartBeat信号(其实和AppendEntries一样, 都是一个接口)
+						rf.doAppendCh <- HeartBeat
+						// go rf.sendLogEntry(HeartBeat)
+						DPrintf("%v: %v 赢得了选举，变为领导者，发送了初始心跳",
+							args.Term, rf.me)
+					}
+				}()
+				wonCh <- 1
+				break
+			}
+		} else {
+			// 如果当前任期小于返回的任期, 当前节点变为follower, 停止选举操作
+			if args.Term < reply.Term {
+				func() {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.currentTerm < reply.Term {
+						DPrintf("%v: %v 发送投票后发现自己过时，变回追随者", args.Term, rf.me)
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.identify = FOLLOWER
+						// 选举失败标志
+						wonCh <- 1
+					}
+				}()
+			}
+			break
+		}
+		notGrantedCount++
+		if notGrantedCount > tgt {
+			break
+		}
+	}
+
 }

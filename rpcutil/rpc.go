@@ -38,7 +38,7 @@ func (e *ClientEnd) Call(methodName string, args interface{}, reply interface{})
 
 // 进行tcp连接尝试
 func TryConnect(address string) *rpc.Client {
-	client, err := rpc.DialHTTP("tcp", address)
+	client, err := rpc.Dial("tcp", address)
 	if err != nil {
 		log.Println(err)
 		return nil
